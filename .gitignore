@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data and artifacts
+/data/
+*.pt
+*.pth
+*.ckpt
+
+# Environment files
+.env
+
+# Local AI/assistant files
+.claude/
+CLAUDE.md
+claude.md
+
+# OS files
+.DS_Store

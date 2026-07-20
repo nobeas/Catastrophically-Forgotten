@@ -1,0 +1,279 @@
+"""
+Data loading, dataset restriction, and dataset-level plotting utilities.
+
+Transferred from the NeuroMatch Academy's NeuroAI Course, W2D2 Microlearning.ipynb, Section 1 (Initial setup),
+with no logical changes. `restrict_classes` is also used directly by
+src/experiments/forgetting.py to build the old-class / new-class splits.
+"""
+
+# Importing dependencies
+from IPython.display import Image, SVG, display
+import os
+from pathlib import Path
+
+import random
+from tqdm import tqdm
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy
+import torch
+import torchvision
+import contextlib
+import io
+
+
+# Figure settings
+import ipywidgets as widgets       # interactive display
+%config InlineBackend.figure_format = 'retina'
+plt.style.use("https://raw.githubusercontent.com/ClimateMatchAcademy/course-content/main/cma.mplstyle")
+
+
+# Download MNIST and split into train / validation / test subsets
+def download_mnist(train_prop=0.8, keep_prop=0.5):
+    """
+    Downloads MNIST and splits it into train / validation / test subsets.
+
+    Arguments:
+    - train_prop (float, optional): proportion of the (kept) training data to
+      use for training vs. validation.
+    - keep_prop (float, optional): proportion of the full dataset to keep, to
+      speed up training.
+
+    Returns:
+    - train_set, valid_set, test_set (torch dataset subsets)
+    """
+
+    valid_prop = 1 - train_prop
+    discard_prop = 1 - keep_prop
+
+    transform = torchvision.transforms.Compose(
+        [torchvision.transforms.ToTensor(),
+         torchvision.transforms.Normalize((0.1307,), (0.3081,))]
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):  # to suppress output
+        full_train_set = torchvision.datasets.MNIST(
+            root="./data/", train=True, download=True, transform=transform
+        )
+        full_test_set = torchvision.datasets.MNIST(
+            root="./data/", train=False, download=True, transform=transform
+        )
+
+    train_set, valid_set, _ = torch.utils.data.random_split(
+        full_train_set,
+        [train_prop * keep_prop, valid_prop * keep_prop, discard_prop]
+    )
+    test_set, _ = torch.utils.data.random_split(
+        full_test_set,
+        [keep_prop, discard_prop]
+    )
+
+    print("Number of examples retained:")
+    print(f"  {len(train_set)} (training)")
+    print(f"  {len(valid_set)} (validation)")
+    print(f"  {len(test_set)} (test)")
+
+    return train_set, valid_set, test_set
+
+
+def restrict_classes(dataset, classes=[6], keep=True):
+    """
+    Removes or keeps specified classes in a dataset.
+
+    Arguments:
+    - dataset (torch dataset or subset): Dataset with class targets.
+    - classes (list): List of classes to keep or remove.
+    - keep (bool): If True, the classes specified are kept. If False, they are
+      removed.
+
+    Returns:
+    - new_dataset (torch dataset or subset): Dataset restricted as specified.
+    """
+
+    if hasattr(dataset, "dataset"):
+        indices = np.asarray(dataset.indices)
+        targets = dataset.dataset.targets[indices]
+        dataset = dataset.dataset
+    else:
+        indices = np.arange(len(dataset))
+        targets = dataset.targets
+
+    specified_idxs = np.isin(targets, np.asarray(classes))
+    if keep:
+        retain_indices = indices[specified_idxs]
+    else:
+        retain_indices = indices[~specified_idxs]
+
+    new_dataset = torch.utils.data.Subset(dataset, retain_indices)
+
+    return new_dataset
+
+
+def get_plotting_color(dataset="train", model_idx=None):
+    """Returns a color for the specific dataset, e.g. "train" or model index."""
+    if model_idx is not None:
+        dataset = None
+
+    if model_idx == 0 or dataset == "train":
+        color = "#1F77B4"  # blue
+    elif model_idx == 1 or dataset == "valid":
+        color = "#FF7F0E"  # orange
+    elif model_idx == 2 or dataset == "test":
+        color = "#2CA02C"  # green
+    else:
+        if model_idx is not None:
+            raise NotImplementedError("Colors only implemented for up to 3 models.")
+        else:
+            raise NotImplementedError(
+                f"{dataset} dataset not recognized. Expected 'train', 'valid' "
+                "or 'test'."
+            )
+
+    return color
+
+
+def plot_class_distribution(train_set, valid_set=None, test_set=None,
+                             num_classes=10, ax=None):
+    """ 
+    Function for plotting the number of examples per class in each subset.
+
+    Arguments:
+    - train_set (torch dataset or torch dataset subset): training dataset
+    - valid_set (torch dataset or torch dataset subset, optional): validation
+        dataset
+    - test_set (torch dataset or torch dataset subset, optional): test
+        dataset
+    - num_classes (int, optional): Number of classes in the data.
+    - ax (plt subplot, optional): Axis on which to plot images. If None, a new
+        axis will be created.
+
+    Returns:
+    - ax (plt subplot): Axis on which images were plotted.
+    """
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 3))
+
+    bins = np.arange(num_classes + 1) - 0.5
+
+    for dataset_name, dataset in [
+        ("train", train_set), ("valid", valid_set), ("test", test_set)
+    ]:
+        if dataset is None:
+            continue
+
+        if hasattr(dataset, "dataset"):
+            targets = dataset.dataset.targets[dataset.indices]
+        else:
+            targets = dataset.targets
+
+        ax.hist(
+            targets,
+            bins=bins,
+            alpha=0.3,
+            color=get_plotting_color(dataset_name),
+            label=dataset_name,
+        )
+
+        per_class = len(targets) / num_classes
+        ax.axhline(
+            per_class,
+            ls="dashed",
+            color=get_plotting_color(dataset_name),
+            alpha=0.8
+        )
+
+    ax.set_xticks(range(num_classes))
+    ax.set_title("Counts per class")
+    ax.set_xlabel("Class")
+    ax.set_ylabel("Count")
+    ax.legend(loc="center right")
+
+    return ax
+
+
+def plot_examples(subset, num_examples_per_class=8, MLP=None, seed=None,
+                   batch_size=32, num_classes=10, ax=None):
+    """ 
+    Function for visualizing example images from the dataset, organized by their
+     predicted class, if a model is provided, or by their class, otherwise.
+
+     Arguments:
+    - subset (torch dataset or torch dataset subset): dataset from which to
+        visualized images.
+    - num_examples_per_class (int, optional): number of examples to visualize per
+        class
+    - MLP (MultiLayerPerceptron or None, optional): model to use to retrieve the
+        predicted class for each image. If MLP is None, images will be organized by
+        their class label. Otherwise, images will be organized by their predicted
+        class.
+    - seed (int or None, optional): Seed to use to randomly sample images to
+        visualize.
+    - batch_size (int, optional): If MLP is not None, number of images to
+        retrieve predicted class for at one time.
+    - num_classes (int, optional): Number of classes in the data.
+    - ax (plt subplot, optional): Axis on which to plot images. If None, a new
+        axis will be created.
+
+    Returns:
+    - ax (plt subplot): Axis on which images were plotted.
+    """
+
+    if MLP is None:
+        xlabel = "Class"
+    else:
+        MLP.eval()
+        xlabel = "Predicted class"
+
+    if ax is None:
+        fig_wid = min(8, num_classes * 0.6)
+        fig_hei = min(8, num_examples_per_class * 0.6)
+        _, ax = plt.subplots(figsize=(fig_wid, fig_hei))
+
+    if seed is None:
+        generator = None
+    else:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+    loader = torch.utils.data.DataLoader(
+        subset, batch_size=batch_size, shuffle=True, generator=generator
+    )
+
+    plot_images = {i: list() for i in range(num_classes)}
+    with torch.no_grad():
+        for X, y in loader:
+            if MLP is not None:
+                y = MLP(X)
+                y = torch.argmax(y, axis=1)
+
+            done = True
+            for i in range(num_classes):
+                num_to_add = int(num_examples_per_class - len(plot_images[i]))
+                if num_to_add:
+                    add_images = np.where(y == i)[0]
+                    if len(add_images):
+                        for add_i in add_images[:num_to_add]:
+                            plot_images[i].append(X[add_i, 0].numpy())
+                    if len(plot_images[i]) != num_examples_per_class:
+                        done = False
+
+            if done:
+                break
+
+    hei, wid = X[0, 0].shape
+    final_image = np.full((num_examples_per_class * hei, num_classes * wid), np.nan)
+    for i, images in plot_images.items():
+        if len(images):
+            final_image[: len(images) * hei, i * wid: (i + 1) * wid] = np.vstack(images)
+
+    ax.imshow(final_image, cmap="gray")
+
+    ax.set_xlabel(xlabel)
+    ax.set_xticks((np.arange(num_classes) + 0.5) * wid)
+    ax.set_xticklabels([f"{int(i)}" for i in range(num_classes)])
+    ax.set_yticks([])
+    ax.set_title(f"Examples per {xlabel.lower()}")
+
+    return ax
