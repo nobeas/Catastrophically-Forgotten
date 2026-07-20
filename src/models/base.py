@@ -5,52 +5,90 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Dict, Iterable, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+from tqdm import tqdm
 
 
 class MultiLayerPerceptron(nn.Module):
-    """A simple two-layer MLP for MNIST-style classification."""
+    """A simple two-layer MLP that mirrors the notebook implementation."""
 
-    def __init__(self, num_inputs: int, num_hidden: int, num_outputs: int, bias: bool = True):
+    def __init__(
+        self,
+        num_inputs: int | None = None,
+        num_hidden: int = 100,
+        num_outputs: int = 10,
+        activation_type: str = "sigmoid",
+        bias: bool = False,
+    ):
         super().__init__()
+
+        if num_inputs is None:
+            num_inputs = 784
+
         self.num_inputs = num_inputs
         self.num_hidden = num_hidden
         self.num_outputs = num_outputs
+        self.activation_type = activation_type
+        self.bias = bias
+
         self.lin1 = nn.Linear(num_inputs, num_hidden, bias=bias)
         self.lin2 = nn.Linear(num_hidden, num_outputs, bias=bias)
-        self._initialize_parameters()
-        self.init_lin1_weight = self.lin1.weight.detach().clone()
-        self.init_lin1_bias = self.lin1.bias.detach().clone()
-        self.init_lin2_weight = self.lin2.weight.detach().clone()
-        self.init_lin2_bias = self.lin2.bias.detach().clone()
 
-    def _initialize_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.lin1.weight)
-        nn.init.zeros_(self.lin1.bias)
-        nn.init.xavier_uniform_(self.lin2.weight)
-        nn.init.zeros_(self.lin2.bias)
+        self._store_initial_weights_biases()
+        self._set_activation()
+        self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.lin1(x)
-        x = F.relu(x)
-        x = self.lin2(x)
-        return x
+    def _store_initial_weights_biases(self) -> None:
+        self.init_lin1_weight = self.lin1.weight.data.clone()
+        self.init_lin2_weight = self.lin2.weight.data.clone()
+        if self.bias:
+            self.init_lin1_bias = self.lin1.bias.data.clone()
+            self.init_lin2_bias = self.lin2.bias.data.clone()
 
-    def forward_backprop(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x)
+    def _set_activation(self) -> None:
+        if self.activation_type.lower() == "sigmoid":
+            self.activation = nn.Sigmoid()
+        elif self.activation_type.lower() == "tanh":
+            self.activation = nn.Tanh()
+        elif self.activation_type.lower() == "relu":
+            self.activation = nn.ReLU()
+        elif self.activation_type.lower() == "identity":
+            self.activation = nn.Identity()
+        else:
+            raise NotImplementedError(
+                f"{self.activation_type} activation type not recognized. Only "
+                "'sigmoid', 'relu', 'tanh', and 'identity' have been implemented."
+            )
+
+    def forward(self, X: torch.Tensor, y=None) -> torch.Tensor:
+        h = self.activation(self.lin1(X.reshape(-1, self.num_inputs)))
+        y_pred = self.softmax(self.lin2(h))
+        return y_pred
+
+    def forward_backprop(self, X: torch.Tensor) -> torch.Tensor:
+        return self.forward(X)
 
     def list_parameters(self) -> list[str]:
-        return ["lin1_weight", "lin1_bias", "lin2_weight", "lin2_bias"]
+        params_list = []
+        for layer_str in ["lin1", "lin2"]:
+            params_list.append(f"{layer_str}_weight")
+            if self.bias:
+                params_list.append(f"{layer_str}_bias")
+        return params_list
 
-    def gather_gradient_dict(self) -> Dict[str, Optional[torch.Tensor]]:
-        return {
-            "lin1_weight": self.lin1.weight.grad.detach().clone() if self.lin1.weight.grad is not None else None,
-            "lin1_bias": self.lin1.bias.grad.detach().clone() if self.lin1.bias.grad is not None else None,
-            "lin2_weight": self.lin2.weight.grad.detach().clone() if self.lin2.weight.grad is not None else None,
-            "lin2_bias": self.lin2.bias.grad.detach().clone() if self.lin2.bias.grad is not None else None,
-        }
+    def gather_gradient_dict(self) -> Dict[str, Any]:
+        params_list = self.list_parameters()
+        gradient_dict = {}
+        for param_name in params_list:
+            layer_str, param_str = param_name.split("_")
+            layer = getattr(self, layer_str)
+            grad = getattr(layer, param_str).grad
+            if grad is None:
+                raise RuntimeError("No gradient was computed")
+            gradient_dict[param_name] = grad.detach().clone().numpy()
+        return gradient_dict
 
 
 class BasicOptimizer:
@@ -69,109 +107,126 @@ class BasicOptimizer:
         return getattr(self.optimizer, name)
 
 
-def update_results_by_class_in_place(results: Dict[str, Any], correct_by_class: Counter, seen_by_class: Counter, prefix: str) -> None:
-    results[f"{prefix}_correct_by_class"] = correct_by_class
-    results[f"{prefix}_seen_by_class"] = seen_by_class
+def update_results_by_class_in_place(y, y_pred, result_dict, dataset="train", num_classes=10):
+    """Update a results dictionary in place with per-class statistics."""
+    y_pred = np.argmax(y_pred, axis=1)
+    if len(y) != len(y_pred):
+        raise RuntimeError("Number of predictions does not match number of targets.")
+
+    for i in result_dict[f"{dataset}_seen_by_class"].keys():
+        idxs = np.where(y == int(i))[0]
+        result_dict[f"{dataset}_seen_by_class"][int(i)] += len(idxs)
+
+        num_correct = int(sum(y[idxs] == y_pred[idxs]))
+        result_dict[f"{dataset}_correct_by_class"][int(i)] += num_correct
 
 
-def train_epoch(model: nn.Module, loader, optimizer: BasicOptimizer, criterion=None, device: Optional[str] = None) -> Dict[str, float]:
-    if criterion is None:
-        criterion = nn.CrossEntropyLoss()
+def train_epoch(model: nn.Module, train_loader, valid_loader, optimizer: BasicOptimizer, no_train: bool = False):
+    """Train a model for one epoch, mirroring the notebook implementation."""
+    criterion = nn.NLLLoss()
+
+    epoch_results_dict = {}
+    for dataset in ["train", "valid"]:
+        for sub_str in ["correct_by_class", "seen_by_class"]:
+            epoch_results_dict[f"{dataset}_{sub_str}"] = {i: 0 for i in range(model.num_outputs)}
 
     model.train()
-    total_loss = 0.0
-    total_correct = 0
-    total_seen = 0
-    correct_by_class: Counter = Counter()
-    seen_by_class: Counter = Counter()
-
-    for inputs, targets in loader:
-        if device is not None:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-        outputs = model(inputs.view(inputs.size(0), -1))
-        loss = criterion(outputs, targets)
+    train_losses = []
+    train_acc = []
+    for X, y in train_loader:
+        y_pred = model(X, y=y)
+        loss = criterion(torch.log(y_pred), y)
+        acc = (torch.argmax(y_pred.detach(), axis=1) == y).sum() / len(y)
+        train_losses.append(loss.item() * len(y))
+        train_acc.append(acc.item() * len(y))
+        update_results_by_class_in_place(y, y_pred.detach(), epoch_results_dict, dataset="train", num_classes=model.num_outputs)
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if not no_train:
+            loss.backward()
+            optimizer.step()
 
-        total_loss += loss.item() * len(targets)
-        total_seen += len(targets)
+    num_items = len(train_loader.dataset)
+    epoch_results_dict["avg_train_losses"] = np.sum(train_losses) / num_items
+    epoch_results_dict["avg_train_accuracies"] = np.sum(train_acc) / num_items * 100
 
-        preds = torch.argmax(outputs, dim=1)
-        total_correct += (preds == targets).sum().item()
+    model.eval()
+    valid_losses = []
+    valid_acc = []
+    with torch.no_grad():
+        for X, y in valid_loader:
+            y_pred = model(X)
+            loss = criterion(torch.log(y_pred), y)
+            acc = (torch.argmax(y_pred, axis=1) == y).sum() / len(y)
+            valid_losses.append(loss.item() * len(y))
+            valid_acc.append(acc.item() * len(y))
+            update_results_by_class_in_place(y, y_pred.detach(), epoch_results_dict, dataset="valid", num_classes=model.num_outputs)
 
-        for pred, target in zip(preds.tolist(), targets.tolist()):
-            seen_by_class[target] += 1
-            if pred == target:
-                correct_by_class[target] += 1
+    num_items = len(valid_loader.dataset)
+    epoch_results_dict["avg_valid_losses"] = np.sum(valid_losses) / num_items
+    epoch_results_dict["avg_valid_accuracies"] = np.sum(valid_acc) / num_items * 100
 
-    return {
-        "loss": total_loss / total_seen,
-        "accuracy": 100.0 * total_correct / total_seen,
-        "correct_by_class": correct_by_class,
-        "seen_by_class": seen_by_class,
-    }
+    return epoch_results_dict
 
 
-def train_model(model, train_loader, valid_loader, optimizer, num_epochs: int = 5, criterion=None, verbose: bool = False):
-    results: Dict[str, Any] = {
+def train_model(model, train_loader, valid_loader, optimizer, num_epochs: int = 5, verbose: bool = False):
+    """Train a model across epochs and aggregate notebook-style results."""
+    results_dict = {
         "avg_train_losses": [],
-        "avg_train_accuracies": [],
         "avg_valid_losses": [],
+        "avg_train_accuracies": [],
         "avg_valid_accuracies": [],
     }
 
-    for epoch in range(num_epochs):
-        train_stats = train_epoch(model, train_loader, optimizer, criterion=criterion)
-        valid_stats = evaluate_accuracy(model, valid_loader, criterion=criterion)
+    for e in tqdm(range(num_epochs)):
+        no_train = True if e == 0 else False
+        latest_epoch_results_dict = train_epoch(model, train_loader, valid_loader, optimizer, no_train=no_train)
 
-        results["avg_train_losses"].append(train_stats["loss"])
-        results["avg_train_accuracies"].append(train_stats["accuracy"])
-        results["avg_valid_losses"].append(valid_stats["loss"])
-        results["avg_valid_accuracies"].append(valid_stats["accuracy"])
-
-        update_results_by_class_in_place(results, train_stats["correct_by_class"], train_stats["seen_by_class"], "train")
-        update_results_by_class_in_place(results, valid_stats["correct_by_class"], valid_stats["seen_by_class"], "valid")
+        for key, result in latest_epoch_results_dict.items():
+            if key in results_dict.keys() and isinstance(results_dict[key], list):
+                results_dict[key].append(latest_epoch_results_dict[key])
+            else:
+                results_dict[key] = result
 
         if verbose:
-            print(f"epoch {epoch + 1}: train acc = {train_stats['accuracy']:.2f}%, valid acc = {valid_stats['accuracy']:.2f}%")
+            print(
+                f"epoch {e + 1}: train acc = {latest_epoch_results_dict['avg_train_accuracies']:.2f}%, "
+                f"valid acc = {latest_epoch_results_dict['avg_valid_accuracies']:.2f}%"
+            )
 
-    return results
+    return results_dict
 
 
-def evaluate_accuracy(model: nn.Module, loader, criterion=None):
-    if criterion is None:
-        criterion = nn.CrossEntropyLoss()
-
+def evaluate_accuracy_stats(model: nn.Module, loader):
+    """Return detailed accuracy and loss statistics for a loader."""
     model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_seen = 0
+    correct = 0
+    total = 0
+    losses = []
     correct_by_class: Counter = Counter()
     seen_by_class: Counter = Counter()
 
     with torch.no_grad():
-        for inputs, targets in loader:
-            inputs = inputs.view(inputs.size(0), -1)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            total_loss += loss.item() * len(targets)
-            total_seen += len(targets)
+        for X, y in loader:
+            y_pred = model(X)
+            pred = torch.argmax(y_pred, axis=1)
+            correct += (pred == y).sum().item()
+            total += len(y)
+            losses.append(torch.nn.NLLLoss()(torch.log(y_pred), y).item() * len(y))
 
-            preds = torch.argmax(outputs, dim=1)
-            total_correct += (preds == targets).sum().item()
-
-            for pred, target in zip(preds.tolist(), targets.tolist()):
-                seen_by_class[target] += 1
-                if pred == target:
-                    correct_by_class[target] += 1
+            for pred_i, target_i in zip(pred.tolist(), y.tolist()):
+                seen_by_class[target_i] += 1
+                if pred_i == target_i:
+                    correct_by_class[target_i] += 1
 
     return {
-        "loss": total_loss / total_seen,
-        "accuracy": 100.0 * total_correct / total_seen,
+        "accuracy": 100 * correct / total,
+        "loss": np.sum(losses) / total,
         "correct_by_class": correct_by_class,
         "seen_by_class": seen_by_class,
     }
+
+
+def evaluate_accuracy(model: nn.Module, loader):
+    """Compute accuracy of MLP on a given dataloader without training on it."""
+    return evaluate_accuracy_stats(model, loader)["accuracy"]

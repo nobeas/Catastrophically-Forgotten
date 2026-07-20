@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from src.data import restrict_classes
-from src.models.base import BasicOptimizer, MultiLayerPerceptron, evaluate_accuracy, train_model
+from src.models.base import BasicOptimizer, MultiLayerPerceptron, evaluate_accuracy_stats, train_model
 
 OLD_CLASSES = [0, 1, 2, 3, 4, 5]
 NEW_CLASSES = [6, 7, 8, 9]
@@ -40,7 +40,7 @@ def build_forgetting_loaders(train_set, valid_set, batch_size: int = 32, old_cla
 
 def evaluate_accuracy_for_loader(mlp, loader):
     """Compute accuracy without training on the provided loader."""
-    stats = evaluate_accuracy(mlp, loader)
+    stats = evaluate_accuracy_stats(mlp, loader)
     return stats["accuracy"]
 
 
@@ -58,7 +58,7 @@ def run_forgetting_experiment(
     num_inputs: int = 784,
     num_hidden: int = 100,
     num_outputs: int = 10,
-    bias: bool = True,
+    bias: bool = False,
     verbose: bool = False,
 ):
     """Run a simple forgetting experiment with a backprop model."""

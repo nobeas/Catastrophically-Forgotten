@@ -5,8 +5,6 @@ This repository contains a modular PyTorch project for studying catastrophic for
 ## Project goals
 
 - Compare backpropagation against alternative learning rules in a forgetting experiment.
-- Keep the code organized by concern so the project is easy for a group to extend.
-- Support both sequential and interleaved training conditions.
 
 ## Repository structure
 
