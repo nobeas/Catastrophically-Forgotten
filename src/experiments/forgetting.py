@@ -61,9 +61,13 @@ def run_forgetting_experiment(
     activation_type: str = "sigmoid",
     bias: bool = False,
     verbose: bool = False,
-    record_initial_baseline: bool = True,
 ):
-    """Run a simple forgetting experiment with a backprop model."""
+    """Run a simple forgetting experiment with a backprop model.
+
+    This matches the reference notebook/proof-of-concept flow: the first epoch
+    trains immediately so phase 1 reflects actual learning and phase 2 shows
+    forgetting on the old-class validation set.
+    """
     if model_type != "backprop":
         raise NotImplementedError(f"Model type '{model_type}' is not implemented yet.")
 
@@ -83,7 +87,6 @@ def run_forgetting_experiment(
         optimizer,
         num_epochs=num_epochs_phase1,
         verbose=verbose,
-        record_initial_baseline=record_initial_baseline,
     )
 
     phase2_loader = train_loader_new if condition == "sequential" else train_loader_full
@@ -94,7 +97,6 @@ def run_forgetting_experiment(
         optimizer,
         num_epochs=num_epochs_phase2,
         verbose=verbose,
-        record_initial_baseline=record_initial_baseline,
     )
 
     old_class_acc_trace = phase1_results["avg_valid_accuracies"] + phase2_results["avg_valid_accuracies"]

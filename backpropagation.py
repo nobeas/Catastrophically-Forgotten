@@ -1,0 +1,259 @@
+"""Minimal backpropagation baseline implementation for the forgetting experiment."""
+
+from __future__ import annotations
+
+from collections import Counter
+from typing import Any, Dict, Iterable
+
+import numpy as np
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+
+class MultiLayerPerceptron(nn.Module):
+    """Simple two-layer MLP used as the backpropagation baseline."""
+
+    def __init__(
+        self,
+        num_inputs: int | None = None,
+        num_hidden: int = 100,
+        num_outputs: int = 10,
+        activation_type: str = "sigmoid",
+        bias: bool = False,
+    ):
+        super().__init__()
+        if num_inputs is None:
+            num_inputs = 784
+
+        self.num_inputs = num_inputs
+        self.num_hidden = num_hidden
+        self.num_outputs = num_outputs
+        self.activation_type = activation_type
+        self.bias = bias
+
+        self.lin1 = nn.Linear(num_inputs, num_hidden, bias=bias)
+        self.lin2 = nn.Linear(num_hidden, num_outputs, bias=bias)
+
+        self._store_initial_weights_biases()
+        self._set_activation()
+        self.softmax = nn.Softmax(dim=1)
+
+    def _store_initial_weights_biases(self) -> None:
+        self.init_lin1_weight = self.lin1.weight.data.clone()
+        self.init_lin2_weight = self.lin2.weight.data.clone()
+        if self.bias:
+            self.init_lin1_bias = self.lin1.bias.data.clone()
+            self.init_lin2_bias = self.lin2.bias.data.clone()
+
+    def _set_activation(self) -> None:
+        if self.activation_type.lower() == "sigmoid":
+            self.activation = nn.Sigmoid()
+        elif self.activation_type.lower() == "tanh":
+            self.activation = nn.Tanh()
+        elif self.activation_type.lower() == "relu":
+            self.activation = nn.ReLU()
+        elif self.activation_type.lower() == "identity":
+            self.activation = nn.Identity()
+        else:
+            raise NotImplementedError(
+                f"{self.activation_type} activation type not recognized. Only "
+                "'sigmoid', 'relu', 'tanh', and 'identity' have been implemented."
+            )
+
+    def forward(self, X: torch.Tensor, y=None) -> torch.Tensor:
+        h = self.activation(self.lin1(X.reshape(-1, self.num_inputs)))
+        return self.softmax(self.lin2(h))
+
+    def forward_backprop(self, X: torch.Tensor) -> torch.Tensor:
+        return self.forward(X)
+
+    def list_parameters(self) -> list[str]:
+        params_list: list[str] = []
+        for layer_str in ["lin1", "lin2"]:
+            params_list.append(f"{layer_str}_weight")
+            if self.bias:
+                params_list.append(f"{layer_str}_bias")
+        return params_list
+
+    def gather_gradient_dict(self) -> Dict[str, Any]:
+        gradient_dict: Dict[str, Any] = {}
+        for param_name in self.list_parameters():
+            layer_str, param_str = param_name.split("_")
+            layer = getattr(self, layer_str)
+            grad = getattr(layer, param_str).grad
+            if grad is None:
+                raise RuntimeError("No gradient was computed")
+            gradient_dict[param_name] = grad.detach().clone().numpy()
+        return gradient_dict
+
+
+class BasicOptimizer(torch.optim.Optimizer):
+    """Minimal SGD optimizer used by the baseline training loop."""
+
+    def __init__(
+        self,
+        parameters: Iterable[torch.nn.Parameter] | Iterable[dict],
+        lr: float = 0.01,
+        weight_decay: float = 0.0,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(lr=lr, weight_decay=weight_decay)
+        super().__init__(parameters, defaults)
+
+    def step(self, closure=None) -> None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+
+                if group["weight_decay"] != 0:
+                    param.grad = param.grad.add(param, alpha=group["weight_decay"])
+
+                param.data.add_(param.grad, alpha=-group["lr"])
+
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        super().zero_grad(set_to_none=set_to_none)
+
+
+def update_results_by_class_in_place(y, y_pred, result_dict, dataset="train", num_classes=10):
+    """Track per-class counts for training and validation batches."""
+    y_pred = np.argmax(y_pred, axis=1)
+    if len(y) != len(y_pred):
+        raise RuntimeError("Number of predictions does not match number of targets.")
+
+    for i in result_dict[f"{dataset}_seen_by_class"].keys():
+        idxs = np.where(y == int(i))[0]
+        result_dict[f"{dataset}_seen_by_class"][int(i)] += len(idxs)
+        num_correct = int(sum(y[idxs] == y_pred[idxs]))
+        result_dict[f"{dataset}_correct_by_class"][int(i)] += num_correct
+
+
+def train_epoch(model: nn.Module, train_loader, valid_loader, optimizer: BasicOptimizer, no_train: bool = False):
+    """Train for one epoch and return aggregate metrics."""
+    criterion = nn.NLLLoss()
+    epoch_results = {}
+
+    for dataset in ["train", "valid"]:
+        for sub_str in ["correct_by_class", "seen_by_class"]:
+            epoch_results[f"{dataset}_{sub_str}"] = {i: 0 for i in range(model.num_outputs)}
+
+    model.train()
+    train_losses = []
+    train_acc = []
+    for X, y in train_loader:
+        y_pred = model(X, y=y)
+        loss = criterion(torch.log(y_pred), y)
+        acc = (torch.argmax(y_pred.detach(), axis=1) == y).sum() / len(y)
+        train_losses.append(loss.item() * len(y))
+        train_acc.append(acc.item() * len(y))
+        update_results_by_class_in_place(y, y_pred.detach(), epoch_results, dataset="train", num_classes=model.num_outputs)
+
+        optimizer.zero_grad()
+        if not no_train:
+            loss.backward()
+            optimizer.step()
+
+    num_items = len(train_loader.dataset)
+    epoch_results["avg_train_losses"] = np.sum(train_losses) / num_items
+    epoch_results["avg_train_accuracies"] = np.sum(train_acc) / num_items * 100
+
+    model.eval()
+    valid_losses = []
+    valid_acc = []
+    with torch.no_grad():
+        for X, y in valid_loader:
+            y_pred = model(X)
+            loss = criterion(torch.log(y_pred), y)
+            acc = (torch.argmax(y_pred, axis=1) == y).sum() / len(y)
+            valid_losses.append(loss.item() * len(y))
+            valid_acc.append(acc.item() * len(y))
+            update_results_by_class_in_place(y, y_pred.detach(), epoch_results, dataset="valid", num_classes=model.num_outputs)
+
+    num_items = len(valid_loader.dataset)
+    epoch_results["avg_valid_losses"] = np.sum(valid_losses) / num_items
+    epoch_results["avg_valid_accuracies"] = np.sum(valid_acc) / num_items * 100
+
+    return epoch_results
+
+
+def train_model(
+    model,
+    train_loader,
+    valid_loader,
+    optimizer,
+    num_epochs: int = 5,
+    verbose: bool = False,
+    record_initial_baseline: bool = True,
+):
+    """Train the model across epochs and aggregate notebook-style results."""
+    results = {
+        "avg_train_losses": [],
+        "avg_valid_losses": [],
+        "avg_train_accuracies": [],
+        "avg_valid_accuracies": [],
+    }
+
+    for e in tqdm(range(num_epochs)):
+        no_train = record_initial_baseline and e == 0
+        epoch_results = train_epoch(model, train_loader, valid_loader, optimizer, no_train=no_train)
+
+        for key, value in epoch_results.items():
+            if key in results and isinstance(results[key], list):
+                results[key].append(epoch_results[key])
+            else:
+                results[key] = value
+
+        if verbose:
+            print(
+                f"epoch {e + 1}: train acc = {epoch_results['avg_train_accuracies']:.2f}%, "
+                f"valid acc = {epoch_results['avg_valid_accuracies']:.2f}%"
+            )
+
+    return results
+
+
+def evaluate_accuracy_stats(model: nn.Module, loader):
+    """Return accuracy and loss statistics for a loader."""
+    model.eval()
+    correct = 0
+    total = 0
+    losses = []
+    correct_by_class: Counter = Counter()
+    seen_by_class: Counter = Counter()
+
+    with torch.no_grad():
+        for X, y in loader:
+            y_pred = model(X)
+            pred = torch.argmax(y_pred, axis=1)
+            correct += (pred == y).sum().item()
+            total += len(y)
+            losses.append(torch.nn.NLLLoss()(torch.log(y_pred), y).item() * len(y))
+
+            for pred_i, target_i in zip(pred.tolist(), y.tolist()):
+                seen_by_class[target_i] += 1
+                if pred_i == target_i:
+                    correct_by_class[target_i] += 1
+
+    return {
+        "accuracy": 100 * correct / total,
+        "loss": np.sum(losses) / total,
+        "correct_by_class": correct_by_class,
+        "seen_by_class": seen_by_class,
+    }
+
+
+def evaluate_accuracy(model: nn.Module, loader):
+    """Compute accuracy of the MLP on a given loader without training on it."""
+    return evaluate_accuracy_stats(model, loader)["accuracy"]

@@ -41,9 +41,43 @@ The backpropagation baseline is wired through `src/experiments/forgetting.py`.
 Use the helpers there to build old-class, new-class, and interleaved dataloaders,
 then call `run_forgetting_experiment(...)`.
 
-By default, training matches the original notebook behavior: epoch 0 records an
-initial no-training baseline. If you want every epoch to perform weight updates
-immediately, pass `record_initial_baseline=False`.
+This project is intentionally structured to mirror the reference notebook and the
+proof-of-concept setup:
+
+- a single hidden-layer MLP with sigmoid activations,
+- a simple SGD-style optimizer (`BasicOptimizer`),
+- old-class / new-class / interleaved training phases for catastrophic forgetting.
+
+By default, the forgetting experiment starts training on epoch 0 so phase 1
+reflects real learning and phase 2 shows forgetting on the old-class validation
+set.
+
+## Quick start for collaborators
+
+If you just want the minimal backpropagation baseline, the main entry points are:
+
+- `backpropagation.py` – the minimal implementation of `MultiLayerPerceptron`,
+  `BasicOptimizer`, and `train_model`
+- `src/experiments/forgetting.py` – the forgetting experiment wrapper
+- `src/data.py` – dataset and class-filtering helpers
+
+A tiny smoke test looks like this:
+
+```python
+import torch
+from backpropagation import MultiLayerPerceptron, BasicOptimizer, train_model
+
+model = MultiLayerPerceptron(num_inputs=2, num_hidden=4, num_outputs=2, bias=False)
+X = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float32)
+y = torch.tensor([0, 1], dtype=torch.long)
+train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X, y), batch_size=2)
+valid_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X, y), batch_size=2)
+optimizer = BasicOptimizer(model.parameters(), lr=0.01)
+results = train_model(model, train_loader, valid_loader, optimizer, num_epochs=2, verbose=False)
+```
+
+The training loop should run without errors and produce accuracy metrics in the
+returned results dictionary.
 
 ## Adding new learning-rule models
 
